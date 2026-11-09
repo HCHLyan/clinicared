@@ -1,0 +1,20 @@
+title = "ClínicaRed gitleaks config"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "clinicared-db-url-with-password"
+description = "PostgreSQL/AMQP URL with inline password"
+regex = '''(?i)(postgres(ql)?(\+psycopg2)?|amqps?)://[^:\s/]+:[^@\s$\{]{6,}@'''
+tags = ["credential"]
+
+[allowlist]
+description = "Local-only placeholders and CI service credentials"
+regexes = [
+  '''change-me-local-only''',
+  '''ci-only-password''',
+  '''test-only-[a-z-]+''',
+  '''benchmark-only-pepper''',
+]
+paths = ['''\.env\.example$''']

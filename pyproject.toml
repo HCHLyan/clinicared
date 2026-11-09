@@ -1,0 +1,40 @@
+[project]
+name = "clinicared-backend"
+version = "2.0.0"
+requires-python = ">=3.13,<3.14"
+
+[tool.pytest.ini_options]
+pythonpath = [".", "spark/jobs", "dags"]
+testpaths = ["tests"]
+markers = ["integration: requires PostgreSQL (INTEGRATION_DATABASE_URL)"]
+addopts = "-ra --strict-markers"
+filterwarnings = ["ignore::DeprecationWarning:airflow.*"]
+
+[tool.ruff]
+line-length = 130
+target-version = "py313"
+extend-exclude = ["venv", ".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "N", "BLE", "D"]
+# E501: line length is owned by `ruff format`; S608: SQL is built only from constants.
+ignore = ["D100", "D104", "D105", "D107", "D203", "D213", "E501", "S101", "S608", "B008"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D", "S", "N802"]
+"spark/**" = ["D401", "D103"]
+"src/seeders/**" = ["S311", "D103"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+ignore_missing_imports = true
+files = ["src/domain", "src/services/dispatch_service.py", "src/services/webhook_service.py", "src/analytics"]
+
+[tool.coverage.run]
+source = ["src"]
+omit = ["src/seeders/*", "src/workers/*"]
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true

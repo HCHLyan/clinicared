@@ -1,0 +1,6 @@
+# pyspark must equal pyspark-client in constraints-3.3.2/constraints-3.13.txt (4.2.0):
+# both distributions install into the same `pyspark` package directory.
+# boto3/botocore are the exact Airflow (amazon provider) constraint pins.
+pyspark==4.2.0
+boto3==1.43.75
+botocore==1.43.75

@@ -1,0 +1,200 @@
+# Local end-to-end stack: PostgreSQL, RabbitMQ, API, workers, outbox relay and
+# Airflow 3 (CeleryExecutor with RabbitMQ broker). Secrets come from .env
+# (see .env.example); compose aborts if a required one is missing.
+x-app-env: &app-env
+  ENVIRONMENT: local
+  DB_HOST: postgres
+  DB_PORT: "5432"
+  DB_NAME: clinicared_db
+  DB_USER: ${DB_USER:-postgres}
+  DB_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
+  DB_SSLMODE: disable
+  RABBITMQ_URL: amqp://${RABBITMQ_USER:-clinicared}:${RABBITMQ_PASSWORD:?set RABBITMQ_PASSWORD}@rabbitmq:5672/clinicared
+  MESSAGING_GATEWAY_URL: http://backend:8000/simulate/messaging/send
+  WEBHOOK_SIGNING_SECRET: ${WEBHOOK_SIGNING_SECRET:?set WEBHOOK_SIGNING_SECRET}
+  PSEUDONYMIZATION_PEPPER: ${PSEUDONYMIZATION_PEPPER:?set PSEUDONYMIZATION_PEPPER}
+
+x-airflow: &airflow
+  build:
+    context: .
+    dockerfile: docker/airflow/Dockerfile
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DEFAULT_TIMEZONE: America/Bogota
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:-}
+    # FAB keeps the username/password login (and `airflow users create`) of the Airflow 2 setup.
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    # Airflow 3: workers run tasks through the Task Execution API served by the api-server.
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:?set AIRFLOW_JWT_SECRET}
+    AIRFLOW__API__SECRET_KEY: ${AIRFLOW_API_SECRET_KEY:?set AIRFLOW_API_SECRET_KEY}
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${AIRFLOW_DB_PASSWORD:?set AIRFLOW_DB_PASSWORD}@airflow-db:5432/airflow
+    AIRFLOW__CELERY__BROKER_URL: amqp://${RABBITMQ_USER:-clinicared}:${RABBITMQ_PASSWORD}@rabbitmq:5672/airflow
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:${AIRFLOW_DB_PASSWORD}@airflow-db:5432/airflow
+    # Airflow 3 replacement of [scheduler] dag_dir_list_interval.
+    AIRFLOW__DAG_PROCESSOR__REFRESH_INTERVAL: "60"
+    AIRFLOW_CONN_CLINICARED_DB: postgresql://${DB_USER:-postgres}:${DB_PASSWORD}@postgres:5432/clinicared_db
+    AIRFLOW_CONN_CLINICARED_RABBITMQ: amqp://${RABBITMQ_USER:-clinicared}:${RABBITMQ_PASSWORD}@rabbitmq:5672/clinicared
+    AIRFLOW_CONN_SPARK_DEFAULT: spark://local?deploy-mode=client
+    AIRFLOW_VAR_PSEUDONYMIZATION_PEPPER: ${PSEUDONYMIZATION_PEPPER}
+    PYTHONPATH: /opt/airflow:/opt/airflow/dags:/opt/airflow/spark/jobs
+  volumes:
+    - ./dags:/opt/airflow/dags:ro
+    - ./src:/opt/airflow/src:ro
+    - ./spark:/opt/airflow/spark:ro
+    - ./landing:/opt/airflow/landing
+    - lake:/opt/airflow/lake
+  depends_on:
+    airflow-db: { condition: service_healthy }
+    rabbitmq-init: { condition: service_completed_successfully }
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
+      POSTGRES_DB: clinicared_db
+    ports: ["5432:5432"]
+    volumes:
+      # PostgreSQL 18 images keep PGDATA in /var/lib/postgresql/18/docker; mount the parent.
+      - postgres_data:/var/lib/postgresql
+      - ./docs/database/01_init_schema.sql:/docker-entrypoint-initdb.d/01_init_schema.sql:ro
+      - ./docs/database/02_us04_schema.sql:/docker-entrypoint-initdb.d/02_us04_schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d clinicared_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:4.3-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-clinicared}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?set RABBITMQ_PASSWORD}
+      RABBITMQ_DEFAULT_VHOST: clinicared
+    ports: ["5672:5672", "15672:15672"]
+    volumes:
+      - ./docker/rabbitmq/20-clinicared.conf:/etc/rabbitmq/conf.d/20-clinicared.conf:ro
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  # Separate vhost for the Airflow Celery broker (isolates patient traffic).
+  rabbitmq-init:
+    image: curlimages/curl:8.23.0
+    depends_on: { rabbitmq: { condition: service_healthy } }
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        curl -fsS -u "$${RMQ_USER}:$${RMQ_PASS}" -X PUT http://rabbitmq:15672/api/vhosts/airflow &&
+        curl -fsS -u "$${RMQ_USER}:$${RMQ_PASS}" -X PUT -H 'content-type: application/json'
+        -d '{"configure":".*","write":".*","read":".*"}' http://rabbitmq:15672/api/permissions/airflow/$${RMQ_USER}
+    environment:
+      RMQ_USER: ${RABBITMQ_USER:-clinicared}
+      RMQ_PASS: ${RABBITMQ_PASSWORD}
+
+  backend:
+    build: .
+    restart: unless-stopped
+    ports: ["8000:8000"]
+    environment: *app-env
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  reminder-worker:
+    build: .
+    restart: unless-stopped
+    command: ["python", "-m", "src.workers.reminder_worker", "--queue", "reminders"]
+    environment: *app-env
+    depends_on:
+      postgres: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+
+  waitlist-worker:
+    build: .
+    restart: unless-stopped
+    command: ["python", "-m", "src.workers.reminder_worker", "--queue", "waitlist"]
+    environment: *app-env
+    depends_on:
+      postgres: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+
+  outbox-relay:
+    build: .
+    restart: unless-stopped
+    command: ["python", "-m", "src.messaging.outbox_relay"]
+    environment: *app-env
+    depends_on:
+      postgres: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+
+  airflow-db:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD:?set AIRFLOW_DB_PASSWORD}
+      POSTGRES_DB: airflow
+    volumes: [airflow_db:/var/lib/postgresql]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 5s
+      retries: 10
+
+  airflow-init:
+    <<: *airflow
+    command: >
+      bash -c "airflow db migrate &&
+               airflow users create --role Admin --username admin --firstname Admin --lastname Local
+               --email admin@example.com --password \"$${AIRFLOW_ADMIN_PASSWORD}\" || true"
+    environment:
+      <<: *airflow-env
+      AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:?set AIRFLOW_ADMIN_PASSWORD}
+
+  # Airflow 3 replaces `webserver` with `api-server` (UI + REST + Task Execution API).
+  airflow-apiserver:
+    <<: *airflow
+    command: api-server
+    ports: ["8080:8080"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      airflow-init: { condition: service_completed_successfully }
+
+  airflow-scheduler:
+    <<: *airflow
+    command: scheduler
+    depends_on:
+      airflow-init: { condition: service_completed_successfully }
+
+  airflow-triggerer:
+    <<: *airflow
+    command: triggerer
+    depends_on:
+      airflow-init: { condition: service_completed_successfully }
+
+  # Airflow 3 runs DAG parsing as a standalone component.
+  airflow-dag-processor:
+    <<: *airflow
+    command: dag-processor
+    depends_on:
+      airflow-init: { condition: service_completed_successfully }
+
+  airflow-worker:
+    <<: *airflow
+    command: celery worker
+    depends_on:
+      airflow-init: { condition: service_completed_successfully }
+      airflow-apiserver: { condition: service_healthy }
+
+volumes:
+  postgres_data:
+  airflow_db:
+  lake:

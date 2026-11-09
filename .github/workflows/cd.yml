@@ -1,0 +1,110 @@
+name: CD
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write   # GitHub OIDC -> AWS IAM role (no long-lived AWS keys)
+
+concurrency:
+  group: cd-production
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: clinicared/api
+  ECS_CLUSTER: clinicared-prod
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    environment: production   # required reviewers configured on the environment
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - id: meta
+        run: echo "image=${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/arm64   # Fargate Graviton (see ADR-010)
+          push: true
+          tags: ${{ steps.meta.outputs.image }}
+          provenance: true
+          sbom: true
+      - name: Publish Spark jobs and DAGs
+        env:
+          ARTIFACTS_BUCKET: ${{ vars.ARTIFACTS_BUCKET }}
+        run: |
+          (cd spark/jobs && zip -qr jobs.zip clinicared_spark)
+          aws s3 sync spark/jobs "s3://${ARTIFACTS_BUCKET}/spark/jobs/${IMAGE_TAG}/" --delete
+          aws s3 sync spark/jobs "s3://${ARTIFACTS_BUCKET}/spark/jobs/current/" --delete
+          aws s3 sync dags "s3://${ARTIFACTS_BUCKET}/airflow/dags/" --delete --exclude "__pycache__/*"
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment: production
+    strategy:
+      max-parallel: 1
+      matrix:
+        include:
+          - { service: clinicared-api, taskdef: infra/ecs/taskdef-api.json, container: api }
+          - { service: clinicared-reminder-worker, taskdef: infra/ecs/taskdef-reminder-worker.json, container: reminder-worker }
+          - { service: clinicared-waitlist-worker, taskdef: infra/ecs/taskdef-waitlist-worker.json, container: waitlist-worker }
+          - { service: clinicared-outbox-relay, taskdef: infra/ecs/taskdef-outbox-relay.json, container: outbox-relay }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Substitute environment values
+        env:
+          TASKDEF: ${{ matrix.taskdef }}
+          ACCOUNT: ${{ secrets.AWS_ACCOUNT_ID }}
+          RDS: ${{ vars.RDS_ENDPOINT }}
+          GATEWAY: ${{ vars.MESSAGING_GATEWAY_URL }}
+        run: |
+          sed -i -e "s|<AWS_ACCOUNT_ID>|${ACCOUNT}|g" -e "s|<RDS_ENDPOINT>|${RDS}|g" -e "s|<MESSAGING_GATEWAY_URL>|${GATEWAY}|g" "$TASKDEF"
+          if grep -q '<[A-Z_]*>' "$TASKDEF"; then echo "::error::unresolved token in $TASKDEF"; exit 1; fi
+      - id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ${{ matrix.taskdef }}
+          container-name: ${{ matrix.container }}
+          image: ${{ needs.build-and-push.outputs.image }}
+      - name: Deploy (rolling, circuit breaker rolls back on failure)
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          service: ${{ matrix.service }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+          wait-for-minutes: 15
+
+  smoke-test:
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Readiness + latency smoke test
+        env:
+          API_URL: ${{ vars.API_BASE_URL }}
+        run: |
+          for i in $(seq 1 20); do
+            curl -fsS -o /dev/null -w "%{time_total}\n" "$API_URL/health/ready" >> times.txt
+          done
+          sort -n times.txt | awk '{a[NR]=$1} END {p=a[int(NR*0.95)]; print "p95="p; if (p > 0.4) exit 1}'

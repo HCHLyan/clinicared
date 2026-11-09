@@ -1,0 +1,14 @@
+# Installed on top of apache/airflow:3.3.2-python3.13 with the official constraints file:
+#   pip install -r requirements-airflow.txt -r requirements-spark.txt \
+#     --constraint https://raw.githubusercontent.com/apache/airflow/constraints-3.3.2/constraints-3.13.txt
+# Provider pins below are the exact versions of that constraints file; apache-airflow is
+# listed so no provider can silently up/downgrade the core.
+apache-airflow==3.3.2
+apache-airflow-providers-amazon==9.36.0
+apache-airflow-providers-apache-spark[pyspark]==6.3.2
+apache-airflow-providers-celery==3.24.0
+apache-airflow-providers-fab==3.9.0
+apache-airflow-providers-postgres==7.0.2
+apache-airflow-providers-standard==1.19.0
+# Not in the Airflow matrix; must equal the pin in requirements.txt (src/ runs in workers).
+pika==1.4.4

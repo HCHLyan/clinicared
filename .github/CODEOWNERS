@@ -1,0 +1,8 @@
+# Every PR needs approval from the owning team (enforced by branch protection).
+*                       @clinicared/backend
+/dags/                  @clinicared/data-platform
+/spark/                 @clinicared/data-platform
+/infra/                 @clinicared/devops
+/.github/               @clinicared/devops
+/docs/privacy/          @clinicared/privacy-office
+/docs/database/         @clinicared/backend @clinicared/data-platform

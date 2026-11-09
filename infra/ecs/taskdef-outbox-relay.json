@@ -1,0 +1,38 @@
+{
+  "family": "clinicared-outbox-relay",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "runtimePlatform": { "cpuArchitecture": "ARM64", "operatingSystemFamily": "LINUX" },
+  "cpu": "256",
+  "memory": "512",
+  "executionRoleArn": "arn:aws:iam::<AWS_ACCOUNT_ID>:role/clinicared-ecs-execution",
+  "taskRoleArn": "arn:aws:iam::<AWS_ACCOUNT_ID>:role/clinicared-worker-task",
+  "containerDefinitions": [
+    {
+      "name": "outbox-relay",
+      "image": "REPLACED_BY_PIPELINE",
+      "essential": true,
+      "readonlyRootFilesystem": true,
+      "user": "10001",
+      "command": ["python", "-m", "src.messaging.outbox_relay"],
+      "stopTimeout": 30,
+      "environment": [
+        { "name": "ENVIRONMENT", "value": "production" },
+        { "name": "DB_HOST", "value": "<RDS_ENDPOINT>" },
+        { "name": "DB_NAME", "value": "clinicared_db" },
+        { "name": "DB_SSLMODE", "value": "require" },
+        { "name": "DB_POOL_SIZE", "value": "2" }
+      ],
+      "secrets": [
+        { "name": "DB_USER", "valueFrom": "arn:aws:secretsmanager:us-east-1:<AWS_ACCOUNT_ID>:secret:clinicared/db:username::" },
+        { "name": "DB_PASSWORD", "valueFrom": "arn:aws:secretsmanager:us-east-1:<AWS_ACCOUNT_ID>:secret:clinicared/db:password::" },
+        { "name": "RABBITMQ_URL", "valueFrom": "arn:aws:secretsmanager:us-east-1:<AWS_ACCOUNT_ID>:secret:clinicared/rabbitmq:url::" },
+        { "name": "WEBHOOK_SIGNING_SECRET", "valueFrom": "arn:aws:secretsmanager:us-east-1:<AWS_ACCOUNT_ID>:secret:clinicared/webhook-signing-secret" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": { "awslogs-group": "/clinicared/workers", "awslogs-region": "us-east-1", "awslogs-stream-prefix": "outbox" }
+      }
+    }
+  ]
+}

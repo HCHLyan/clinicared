@@ -1,0 +1,49 @@
+{
+  "family": "clinicared-api",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "runtimePlatform": { "cpuArchitecture": "ARM64", "operatingSystemFamily": "LINUX" },
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "arn:aws:iam::<AWS_ACCOUNT_ID>:role/clinicared-ecs-execution",
+  "taskRoleArn": "arn:aws:iam::<AWS_ACCOUNT_ID>:role/clinicared-api-task",
+  "containerDefinitions": [
+    {
+      "name": "api",
+      "image": "REPLACED_BY_PIPELINE",
+      "essential": true,
+      "readonlyRootFilesystem": true,
+      "user": "10001",
+      "portMappings": [{ "containerPort": 8000, "protocol": "tcp" }],
+      "environment": [
+        { "name": "ENVIRONMENT", "value": "production" },
+        { "name": "DB_HOST", "value": "<RDS_ENDPOINT>" },
+        { "name": "DB_NAME", "value": "clinicared_db" },
+        { "name": "DB_SSLMODE", "value": "require" },
+        { "name": "MESSAGING_GATEWAY_URL", "value": "<MESSAGING_GATEWAY_URL>" },
+        { "name": "METRICS_NAMESPACE", "value": "ClinicaRed" }
+      ],
+      "secrets": [
+        { "name": "DB_USER", "valueFrom": "arn:aws:secretsmanager:us-east-1:<AWS_ACCOUNT_ID>:secret:clinicared/db:username::" },
+        { "name": "DB_PASSWORD", "valueFrom": "arn:aws:secretsmanager:us-east-1:<AWS_ACCOUNT_ID>:secret:clinicared/db:password::" },
+        { "name": "RABBITMQ_URL", "valueFrom": "arn:aws:secretsmanager:us-east-1:<AWS_ACCOUNT_ID>:secret:clinicared/rabbitmq:url::" },
+        { "name": "WEBHOOK_SIGNING_SECRET", "valueFrom": "arn:aws:secretsmanager:us-east-1:<AWS_ACCOUNT_ID>:secret:clinicared/webhook-signing-secret" },
+        { "name": "PSEUDONYMIZATION_PEPPER", "valueFrom": "arn:aws:secretsmanager:us-east-1:<AWS_ACCOUNT_ID>:secret:clinicared/pseudonymization-pepper:pepper::" }
+      ],
+      "mountPoints": [{ "sourceVolume": "tmp", "containerPath": "/tmp" }],
+      "healthCheck": {
+        "command": ["CMD-SHELL", "curl -fsS http://localhost:8000/health || exit 1"],
+        "interval": 30, "timeout": 5, "retries": 3, "startPeriod": 20
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/clinicared/api",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "api"
+        }
+      }
+    }
+  ],
+  "volumes": [{ "name": "tmp" }]
+}
